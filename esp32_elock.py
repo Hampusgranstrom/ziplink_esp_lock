@@ -25,6 +25,18 @@ if uart:
 del findBaudrate, _init_gm60
 
 #########################################
+## NFC PN532 Init
+if NFC_ACTIVE:
+    print("NFC Init")
+    from nfc_pn532 import NFC_PN532
+    nfc_reader = NFC_PN532(NFC_UART_ID, NFC_TX_PIN, NFC_RX_PIN, NFC_BAUD)
+    fw = nfc_reader.get_firmware_version()
+    if fw:
+        print(f"PN532 FW: IC=0x{fw[0]:02X} Ver={fw[1]}.{fw[2]}")
+    else:
+        print("PN532: No response - check wiring!")
+
+#########################################
 ## ********* pre_Main Start *************#
 print("pre_Main Start")
 waitforSerial = asyncio.ThreadSafeFlag()
@@ -270,6 +282,20 @@ async def serialRead():
         else:
             dbg('Wrong format')
         gc.collect()
+
+
+async def nfcRead():
+    if not NFC_ACTIVE: dbg('NFC is not active!'); return
+    dbg('Starting: nfcRead', '>> ')
+    while True:
+        try:
+            success, payload = nfc_reader.poll()
+            if success and payload:
+                green('NFC key received', ' >> ')
+                asyncio.create_task(testHMAC(payload.encode()))
+        except Exception as e:
+            dbg(f'NFC error: {e}')
+        await asyncio.sleep_ms(NFC_POLL_INTERVAL_MS)
 
 
 async def wZone(zone: int | bytes = 0x00, values: bytes | int | tuple[int|bytes] = 0x00, lens=1) -> None:
@@ -568,6 +594,11 @@ if SERIAL_ACTIVE:
     sRead = asyncio.StreamReader(uart)  # Global serial Stream
     sWrite = asyncio.StreamWriter(uart)  # Global serial Stream
     loop.create_task(serialRead())
+
+if NFC_ACTIVE:
+    print(" NFC",end="")
+    dbg('NFC-Task-Init')
+    loop.create_task(nfcRead())
 
 if not WIFI_ACTIVE:
     print(" NO-WIFI",end="")
