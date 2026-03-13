@@ -15,14 +15,17 @@ from _utils import *
 
 #########################################
 ## Find baudrate
-print("Find baudrate")
-import findBaudrate
-uart=findBaudrate.getBPS()
-if uart:
-    print("_init_gm60")
-    import _init_gm60
-
-del findBaudrate, _init_gm60
+uart = None
+if SERIAL_ACTIVE:
+    print("Find baudrate")
+    import findBaudrate
+    uart=findBaudrate.getBPS()
+    if uart:
+        print("_init_gm60")
+        import _init_gm60
+    del findBaudrate, _init_gm60
+else:
+    print("Serial/GM60 disabled")
 
 #########################################
 ## NFC PN532 Init

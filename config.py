@@ -11,7 +11,7 @@ from _key_new import HASH_KEY_NEW
 # TODO - seperate SERIAL // GM60 (serial)
 DEBUG:         bool = const(True)
 WIFI_ACTIVE:   bool = const(True)
-SERIAL_ACTIVE: bool = const(True)
+SERIAL_ACTIVE: bool = const(False)  # Disabled — PN532 uses UART2 pins for testing
 NFC_ACTIVE:    bool = const(True)
 PORTS_ACTIVE:  bool = const(True)
 TUNE_ACTIVE:   bool = const(True)
