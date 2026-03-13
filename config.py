@@ -4,6 +4,7 @@
 from micropython import const
 from _cfg_network import *
 from _cfg_serial import *
+from _cfg_nfc import *
 from _key_old import HASH_KEY
 from _key_new import HASH_KEY_NEW
 
@@ -11,6 +12,7 @@ from _key_new import HASH_KEY_NEW
 DEBUG:         bool = const(True)
 WIFI_ACTIVE:   bool = const(True)
 SERIAL_ACTIVE: bool = const(True)
+NFC_ACTIVE:    bool = const(True)
 PORTS_ACTIVE:  bool = const(True)
 TUNE_ACTIVE:   bool = const(True)
 NVS_ACTIVE:    bool = const(True)
