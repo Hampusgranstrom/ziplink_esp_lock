@@ -14,27 +14,51 @@ from config import *
 from _utils import *
 
 #########################################
-## Find baudrate
-print("Find baudrate")
-import findBaudrate
-uart=findBaudrate.getBPS()
-if uart:
-    print("_init_gm60")
-    import _init_gm60
+## Pin conflict check
+if SERIAL_ACTIVE and NFC_ACTIVE:
+    _gm60_pins = {GM60_TX_PIN, GM60_RX_PIN}
+    _nfc_pins = {NFC_TX_PIN, NFC_RX_PIN}
+    if _gm60_pins & _nfc_pins:  # Intersection = shared pins
+        red(f"PIN CONFLICT! GM60 pins {_gm60_pins} overlap with NFC pins {_nfc_pins}")
+        red("Fix _cfg_serial.py and/or _cfg_nfc.py — halting!")
+        while True:
+            time.sleep(1)
+    if GM60_UART_ID == NFC_UART_ID:
+        red(f"UART CONFLICT! GM60 and NFC both use UART({GM60_UART_ID})")
+        red("Fix _cfg_serial.py and/or _cfg_nfc.py — halting!")
+        while True:
+            time.sleep(1)
+    del _gm60_pins, _nfc_pins
 
-del findBaudrate, _init_gm60
+#########################################
+## Find baudrate
+uart = None
+if SERIAL_ACTIVE:
+    print("Find baudrate")
+    import findBaudrate
+    uart=findBaudrate.getBPS()
+    if uart:
+        print("_init_gm60")
+        import _init_gm60
+    del findBaudrate, _init_gm60
+else:
+    print("Serial/GM60 disabled")
 
 #########################################
 ## NFC PN532 Init
+nfc_reader = None
 if NFC_ACTIVE:
     print("NFC Init")
-    from nfc_pn532 import NFC_PN532
-    nfc_reader = NFC_PN532(NFC_UART_ID, NFC_TX_PIN, NFC_RX_PIN, NFC_BAUD)
-    fw = nfc_reader.get_firmware_version()
-    if fw:
-        print(f"PN532 FW: IC=0x{fw[0]:02X} Ver={fw[1]}.{fw[2]}")
-    else:
-        print("PN532: No response - check wiring!")
+    try:
+        from nfc_pn532 import NFC_PN532
+        nfc_reader = NFC_PN532(NFC_UART_ID, NFC_TX_PIN, NFC_RX_PIN, NFC_BAUD)
+        fw = nfc_reader.get_firmware_version()
+        if fw:
+            print(f"PN532 FW: IC=0x{fw[0]:02X} Ver={fw[1]}.{fw[2]}")
+        else:
+            print("PN532: No response - will retry in background")
+    except Exception as e:
+        print(f"PN532: Init failed ({e}) - will retry in background")
 
 #########################################
 ## ********* pre_Main Start *************#
@@ -285,8 +309,27 @@ async def serialRead():
 
 
 async def nfcRead():
+    global nfc_reader
     if not NFC_ACTIVE: dbg('NFC is not active!'); return
     dbg('Starting: nfcRead', '>> ')
+
+    # If init failed at boot, retry periodically
+    _retry_interval_ms = 5000
+    while nfc_reader is None or not nfc_reader._initialized:
+        dbg('NFC: Waiting for PN532...')
+        await asyncio.sleep_ms(_retry_interval_ms)
+        try:
+            if nfc_reader is None:
+                from nfc_pn532 import NFC_PN532
+                nfc_reader = NFC_PN532(NFC_UART_ID, NFC_TX_PIN, NFC_RX_PIN, NFC_BAUD)
+            else:
+                nfc_reader._init_hardware()
+            if nfc_reader._initialized:
+                green('PN532 connected!')
+        except Exception as e:
+            dbg(f'NFC retry failed: {e}')
+
+    green('NFC ready', ' >> ')
     while True:
         try:
             success, payload = nfc_reader.poll()
@@ -295,6 +338,7 @@ async def nfcRead():
                 asyncio.create_task(testHMAC(payload.encode()))
         except Exception as e:
             dbg(f'NFC error: {e}')
+        # Yield to asyncio — let GM60 serialRead() run between polls
         await asyncio.sleep_ms(NFC_POLL_INTERVAL_MS)
 
 

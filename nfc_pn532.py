@@ -2,185 +2,252 @@
 # date: 2026-03-13 00:00 #
 # PN532 HSU (UART) driver for MicroPython
 # Reads NDEF Text Records from NTAG213/215/216 tags
+# Production-grade: non-blocking, memory-safe, self-recovering
 #
 from machine import UART, Pin
 import utime as time
+import gc
 
 # PN532 Commands
-_CMD_GETFIRMWAREVERSION = 0x02
-_CMD_SAMCONFIGURATION   = 0x14
-_CMD_INLISTPASSIVETARGET = 0x4A
-_CMD_INDATAEXCHANGE     = 0x40
+_CMD_GETFIRMWAREVERSION  = const(0x02)
+_CMD_SAMCONFIGURATION    = const(0x14)
+_CMD_INLISTPASSIVETARGET = const(0x4A)
+_CMD_INDATAEXCHANGE      = const(0x40)
+_CMD_INRELEASE           = const(0x52)
 
 # NTAG READ command (MIFARE Ultralight compatible)
-_NTAG_CMD_READ = 0x30
+_NTAG_CMD_READ = const(0x30)
 
 # PN532 frame constants
-_PREAMBLE   = 0x00
-_STARTCODE1 = 0x00
-_STARTCODE2 = 0xFF
-_POSTAMBLE  = 0x00
-_HOST_TO_PN532 = 0xD4
-_PN532_TO_HOST = 0xD5
+_HOST_TO_PN532 = const(0xD4)
+_PN532_TO_HOST = const(0xD5)
 
-_ACK = bytes([0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00])
+# Max pages to read from NTAG (page 4..39 = 144 bytes, covers NTAG213)
+_MAX_READ_PAGE = const(40)
+# Pre-allocated read buffer size (16 bytes per read * 9 reads = 144 bytes)
+_READ_BUF_SIZE = const(144)
+# Max consecutive errors before triggering re-init
+_MAX_ERRORS_BEFORE_REINIT = const(10)
 
 
 class NFC_PN532:
 
     def __init__(self, uart_id, tx_pin, rx_pin, baud=115200):
-        self._uart = UART(uart_id, baudrate=baud,
-                          tx=Pin(tx_pin), rx=Pin(rx_pin),
-                          txbuf=256, rxbuf=256)
+        self._uart_id = uart_id
+        self._tx_pin = tx_pin
+        self._rx_pin = rx_pin
+        self._baud = baud
+        self._uart = None
         self._last_uid = None
         self._last_uid_time = 0
         self._uid_cooldown_ms = 3000
+        self._consecutive_errors = 0
+        self._initialized = False
+        # Pre-allocate buffers to avoid heap fragmentation
+        self._rx_buf = bytearray(270)  # Max PN532 frame = 265 bytes
+        self._page_buf = bytearray(_READ_BUF_SIZE)
+        self._init_hardware()
+
+    def _init_hardware(self):
+        """Initialize or re-initialize the PN532 hardware."""
+        try:
+            if self._uart:
+                self._uart.deinit()
+        except Exception:
+            pass
+
+        self._uart = UART(self._uart_id, baudrate=self._baud,
+                          tx=Pin(self._tx_pin), rx=Pin(self._rx_pin),
+                          txbuf=256, rxbuf=256)
         self._wakeup()
         time.sleep_ms(50)
-        if not self.sam_config():
-            print("PN532: SAMConfig failed")
+
+        ok = self.sam_config()
+        self._initialized = ok
+        self._consecutive_errors = 0
+        if not ok:
+            print("PN532: SAMConfig failed - check wiring")
+        return ok
 
     def _wakeup(self):
         """Send wakeup sequence for HSU mode."""
-        self._uart.write(bytes([0x55, 0x55, 0x00, 0x00, 0x00,
-                                0x00, 0x00, 0x00, 0x00, 0x00,
-                                0x00, 0x00, 0x00, 0x00, 0x00, 0x00]))
+        # PN532 HSU wakeup: long preamble of 0x55 followed by 0x00s
+        self._uart.write(b'\x55\x55\x55\x00\x00\x00\x00\x00'
+                         b'\x00\x00\x00\x00\x00\x00\x00\x00')
         time.sleep_ms(100)
-        # Flush any stale data
+        self._flush_rx()
+
+    def _flush_rx(self):
+        """Drain any stale data from UART RX buffer."""
         while self._uart.any():
             self._uart.read()
 
     def _write_frame(self, data):
         """Build and send a PN532 HSU frame.
-        data: bytes to send (TFI + command + params)
         Frame: [0x00 0x00 0xFF] [LEN] [LCS] [data...] [DCS] [0x00]
         """
         length = len(data)
-        lcs = (~length + 1) & 0xFF  # Length checksum
-        dcs = (~sum(data) + 1) & 0xFF  # Data checksum
+        lcs = (~length + 1) & 0xFF
+        dcs = (~sum(data) + 1) & 0xFF
 
-        frame = bytes([_PREAMBLE, _STARTCODE1, _STARTCODE2,
-                       length, lcs]) + bytes(data) + bytes([dcs, _POSTAMBLE])
+        # Build frame in one allocation
+        frame = bytearray(5 + length + 2)
+        frame[0] = 0x00  # Preamble
+        frame[1] = 0x00  # Start code 1
+        frame[2] = 0xFF  # Start code 2
+        frame[3] = length
+        frame[4] = lcs
+        frame[5:5+length] = data
+        frame[5+length] = dcs
+        frame[6+length] = 0x00  # Postamble
+
+        self._flush_rx()  # Clear stale RX data before every command
         self._uart.write(frame)
 
-    def _read_response(self, timeout_ms=200):
-        """Read a PN532 response frame. Returns payload (after TFI) or None."""
+    def _read_bytes(self, timeout_ms):
+        """Read all available bytes from UART into self._rx_buf.
+        Returns number of bytes read. Uses incremental reads with
+        short inter-byte gaps to ensure complete frames.
+        """
         deadline = time.ticks_add(time.ticks_ms(), timeout_ms)
+        n = 0
+        max_n = len(self._rx_buf)
 
-        # Wait for data
+        # Wait for first byte
         while not self._uart.any():
             if time.ticks_diff(deadline, time.ticks_ms()) <= 0:
-                return None
+                return 0
             time.sleep_ms(1)
 
-        # Read available bytes with short delays for remaining data
-        time.sleep_ms(10)
-        raw = self._uart.read()
-        if not raw:
-            return None
-
-        # Find preamble + start code: 0x00 0x00 0xFF
-        idx = 0
-        while idx < len(raw) - 5:
-            if raw[idx] == 0x00 and raw[idx+1] == 0x00 and raw[idx+2] == 0xFF:
-                break
-            idx += 1
-        else:
-            return None
-
-        idx += 3  # Past start code
-
-        # Check for ACK frame (LEN=0x00, LCS=0xFF)
-        if raw[idx] == 0x00 and idx + 1 < len(raw) and raw[idx+1] == 0xFF:
-            return b''  # ACK
-
-        length = raw[idx]
-        lcs = raw[idx+1]
-        if (length + lcs) & 0xFF != 0:
-            return None  # Bad length checksum
-
-        idx += 2  # Past LEN + LCS
-
-        if idx + length + 1 > len(raw):
-            return None  # Incomplete frame
-
-        payload = raw[idx:idx+length]
-
-        dcs = raw[idx+length]
-        if (sum(payload) + dcs) & 0xFF != 0:
-            return None  # Bad data checksum
-
-        # Skip TFI byte (0xD5), return command response + data
-        if payload[0] == _PN532_TO_HOST:
-            return bytes(payload[1:])
-        return None
-
-    def _wait_for_ack(self, timeout_ms=200):
-        """Wait for ACK frame after sending a command."""
-        deadline = time.ticks_add(time.ticks_ms(), timeout_ms)
-        buf = b''
+        # Read with inter-byte timeout to catch full frame
         while time.ticks_diff(deadline, time.ticks_ms()) > 0:
             if self._uart.any():
-                chunk = self._uart.read()
+                chunk = self._uart.read(max_n - n)
                 if chunk:
-                    buf += chunk
-                    if _ACK in buf:
-                        return True
-            time.sleep_ms(1)
-        return False
+                    cl = len(chunk)
+                    if n + cl > max_n:
+                        cl = max_n - n
+                    self._rx_buf[n:n+cl] = chunk[:cl]
+                    n += cl
+                    if n >= max_n:
+                        break
+            else:
+                # Short gap — wait for more bytes or declare frame complete
+                time.sleep_ms(3)
+                if not self._uart.any():
+                    break  # No more bytes coming
+
+        return n
+
+    def _parse_frame(self, buf, n):
+        """Parse a PN532 response frame from buffer.
+        Returns payload bytes (after TFI) or None.
+        Skips ACK frames automatically.
+        """
+        # Scan for preamble: 0x00 0x00 0xFF
+        i = 0
+        result = None
+        while i < n - 5:
+            if buf[i] == 0x00 and buf[i+1] == 0x00 and buf[i+2] == 0xFF:
+                i += 3
+
+                # ACK frame: LEN=0x00 LCS=0xFF
+                if i + 1 < n and buf[i] == 0x00 and buf[i+1] == 0xFF:
+                    i += 2
+                    continue  # Skip ACK, look for response frame after it
+
+                if i + 1 >= n:
+                    return None
+
+                length = buf[i]
+                lcs = buf[i+1]
+                if (length + lcs) & 0xFF != 0:
+                    return None  # Bad length checksum
+
+                i += 2
+
+                if i + length + 1 > n:
+                    return None  # Incomplete frame
+
+                # Verify data checksum
+                dcs = buf[i + length]
+                dcs_calc = 0
+                for j in range(length):
+                    dcs_calc += buf[i+j]
+                if (dcs_calc + dcs) & 0xFF != 0:
+                    return None  # Bad data checksum
+
+                # Verify TFI
+                if buf[i] != _PN532_TO_HOST:
+                    return None
+
+                # Return payload (skip TFI byte)
+                result = bytes(buf[i+1:i+length])
+                return result
+            else:
+                i += 1
+
+        return None
 
     def _send_command(self, cmd, params=b'', timeout_ms=200):
-        """Send command, wait for ACK, then read response."""
+        """Send command, read ACK + response in one pass."""
         data = bytes([_HOST_TO_PN532, cmd]) + bytes(params)
         self._write_frame(data)
 
-        if not self._wait_for_ack(timeout_ms):
+        # Read everything: ACK + response arrive in sequence
+        n = self._read_bytes(timeout_ms)
+        if n == 0:
             return None
 
-        return self._read_response(timeout_ms)
+        return self._parse_frame(self._rx_buf, n)
+
+    def _record_error(self):
+        """Track consecutive errors. Trigger re-init if threshold exceeded."""
+        self._consecutive_errors += 1
+        if self._consecutive_errors >= _MAX_ERRORS_BEFORE_REINIT:
+            print("PN532: Too many errors, re-initializing...")
+            self._init_hardware()
+
+    def _record_success(self):
+        """Reset error counter on successful operation."""
+        self._consecutive_errors = 0
 
     def get_firmware_version(self):
         """Get PN532 firmware version. Returns (IC, Ver, Rev, Support) or None."""
         resp = self._send_command(_CMD_GETFIRMWAREVERSION, timeout_ms=500)
-        if resp and len(resp) >= 5:
-            # resp[0] = command response code (0x03)
-            return resp[1], resp[2], resp[3], resp[4]
+        if resp and len(resp) >= 4:
+            # resp[0] = IC, resp[1] = Ver, resp[2] = Rev, resp[3] = Support
+            return resp[0], resp[1], resp[2], resp[3]
         return None
 
     def sam_config(self):
         """Configure SAM to normal mode."""
-        # Mode=1 (Normal), Timeout=0, IRQ=0
         resp = self._send_command(_CMD_SAMCONFIGURATION,
-                                  bytes([0x01, 0x00, 0x00]),
-                                  timeout_ms=500)
+                                  b'\x01\x00\x00', timeout_ms=500)
         return resp is not None
 
-    def read_passive_target(self, timeout_ms=100):
+    def read_passive_target(self, timeout_ms=150):
         """Detect an ISO14443A tag. Returns UID bytes or None."""
-        # MaxTg=1, BrTy=0x00 (106 kbps type A)
         resp = self._send_command(_CMD_INLISTPASSIVETARGET,
-                                  bytes([0x01, 0x00]),
-                                  timeout_ms=timeout_ms)
-        if not resp or len(resp) < 3:
+                                  b'\x01\x00', timeout_ms=timeout_ms)
+        if not resp or len(resp) < 6:
             return None
-        # resp[0] = command code (0x4B), resp[1] = number of targets
-        num_targets = resp[1]
+        # resp[0] = num targets, resp[1] = Tg
+        # resp[2:4] = ATQA, resp[4] = SAK, resp[5] = UID length
+        num_targets = resp[0]
         if num_targets < 1:
             return None
-        # resp[2] = Tg (logical number)
-        # resp[3:5] = ATQA
-        # resp[5] = SAK
-        # resp[6] = UID length
-        if len(resp) < 7:
+        uid_len = resp[5]
+        if len(resp) < 6 + uid_len:
             return None
-        uid_len = resp[6]
-        if len(resp) < 7 + uid_len:
-            return None
-        return bytes(resp[7:7+uid_len])
+        return bytes(resp[6:6+uid_len])
+
+    def _release_target(self):
+        """Release the current target to allow re-detection."""
+        self._send_command(_CMD_INRELEASE, b'\x00', timeout_ms=100)
 
     def _ntag_read_page(self, page):
-        """Read 4 pages (16 bytes) starting at given page number.
-        Uses InDataExchange with NTAG READ command.
+        """Read 4 pages (16 bytes) starting at given page.
         Returns 16 bytes or None.
         """
         resp = self._send_command(_CMD_INDATAEXCHANGE,
@@ -188,41 +255,62 @@ class NFC_PN532:
                                   timeout_ms=200)
         if not resp or len(resp) < 2:
             return None
-        # resp[0] = command code (0x41), resp[1] = status
-        if resp[1] != 0x00:
+        # resp[0] = status byte
+        if resp[0] != 0x00:
             return None
-        return bytes(resp[2:])  # 16 bytes (4 pages)
+        if len(resp) < 17:  # 1 status + 16 data bytes
+            return None
+        return resp[1:17]
 
     def read_ndef_text(self):
-        """Read NTAG memory from page 4, parse NDEF, extract Text Record payload.
-        Returns the key string or None.
+        """Read NTAG memory from page 4, parse NDEF, extract Text Record.
+        Uses pre-allocated buffer to avoid heap fragmentation.
+        Returns key string or None.
         """
-        # Read enough pages to cover NTAG213 (max ~45 pages)
-        # Each read returns 4 pages (16 bytes), start at page 4
-        data = b''
-        for page in range(4, 40, 4):
+        buf = self._page_buf
+        buf_len = 0
+
+        for page in range(4, _MAX_READ_PAGE, 4):
             chunk = self._ntag_read_page(page)
             if not chunk:
                 break
-            data += chunk
-            # Stop early if we find the terminator TLV
-            if 0xFE in chunk:
+            cl = len(chunk)
+            if buf_len + cl > len(buf):
                 break
+            buf[buf_len:buf_len+cl] = chunk
+            buf_len += cl
+            # Stop early at terminator TLV
+            for b in chunk:
+                if b == 0xFE:
+                    return _parse_ndef_text(buf, buf_len)
 
-        if len(data) < 4:
+        if buf_len < 4:
             return None
-
-        return _parse_ndef_text(data)
+        return _parse_ndef_text(buf, buf_len)
 
     def poll(self):
-        """Non-blocking poll for NFC tag. Returns (success, key_string)."""
-        uid = self.read_passive_target(timeout_ms=100)
+        """Non-blocking poll for NFC tag. Returns (success: bool, key: str|None).
+        Designed for use in asyncio loop with short blocking time.
+        """
+        if not self._initialized:
+            self._record_error()
+            return (False, None)
+
+        try:
+            uid = self.read_passive_target(timeout_ms=150)
+        except Exception as e:
+            print(f"PN532 poll error: {e}")
+            self._record_error()
+            return (False, None)
+
         if uid is None:
-            # No tag present — clear last UID after cooldown
+            # No tag — clear cached UID after cooldown
             if self._last_uid and time.ticks_diff(
                     time.ticks_ms(), self._last_uid_time) > self._uid_cooldown_ms:
                 self._last_uid = None
             return (False, None)
+
+        self._record_success()
 
         # Anti-repeat: skip if same tag still present
         now = time.ticks_ms()
@@ -233,38 +321,56 @@ class NFC_PN532:
         self._last_uid = uid
         self._last_uid_time = now
 
-        # Tag detected — read NDEF
-        payload = self.read_ndef_text()
+        # New tag — read NDEF
+        try:
+            payload = self.read_ndef_text()
+        except Exception as e:
+            print(f"PN532 NDEF error: {e}")
+            self._release_target()
+            return (False, None)
+
+        self._release_target()
+        gc.collect()
+
         if payload:
             return (True, payload)
         return (False, None)
 
 
-def _parse_ndef_text(data):
-    """Parse NDEF TLV data and extract Text Record payload.
-    Returns the text string or None.
+def _parse_ndef_text(data, data_len):
+    """Parse NDEF TLV from buffer and extract Text Record payload.
+    Handles both 1-byte and 3-byte TLV length formats.
+    Returns text string or None.
     """
     i = 0
-    while i < len(data):
+    while i < data_len:
         tlv_type = data[i]
+        i += 1
+
         if tlv_type == 0x00:
-            # NULL TLV — skip
-            i += 1
-            continue
+            continue  # NULL TLV, no length field
         if tlv_type == 0xFE:
-            # Terminator TLV
-            return None
-        if i + 1 >= len(data):
+            return None  # Terminator TLV
+
+        if i >= data_len:
             return None
 
-        tlv_len = data[i+1]
-        i += 2
+        # TLV length: 1-byte or 3-byte format
+        if data[i] == 0xFF:
+            # 3-byte length: 0xFF, high, low
+            if i + 2 >= data_len:
+                return None
+            tlv_len = (data[i+1] << 8) | data[i+2]
+            i += 3
+        else:
+            tlv_len = data[i]
+            i += 1
 
         if tlv_type == 0x03:
-            # NDEF Message TLV — parse the NDEF record
-            if i + tlv_len > len(data):
+            # NDEF Message TLV
+            if i + tlv_len > data_len:
                 return None
-            return _parse_ndef_record(data[i:i+tlv_len])
+            return _parse_ndef_record(data, i, tlv_len)
 
         # Skip unknown TLV
         i += tlv_len
@@ -272,55 +378,58 @@ def _parse_ndef_text(data):
     return None
 
 
-def _parse_ndef_record(record):
-    """Parse a single NDEF record and return Text Record payload.
-    Expected: TNF=0x01 (Well-Known), Type='T' (Text).
+def _parse_ndef_record(data, offset, rec_len):
+    """Parse an NDEF record at data[offset:offset+rec_len].
+    Validates TNF=0x01 (Well-Known) and Type='T' (Text).
+    Returns text string or None.
     """
-    if len(record) < 3:
+    end = offset + rec_len
+    if offset + 3 > end:
         return None
 
-    header = record[0]
+    header = data[offset]
     tnf = header & 0x07
     sr = (header >> 4) & 0x01  # Short Record flag
-
-    type_len = record[1]
+    type_len = data[offset + 1]
 
     if sr:
-        payload_len = record[2]
-        offset = 3
-    else:
-        if len(record) < 6:
+        if offset + 3 > end:
             return None
-        payload_len = (record[2] << 24) | (record[3] << 16) | (record[4] << 8) | record[5]
-        offset = 6
+        payload_len = data[offset + 2]
+        pos = offset + 3
+    else:
+        if offset + 6 > end:
+            return None
+        payload_len = ((data[offset+2] << 24) | (data[offset+3] << 16) |
+                       (data[offset+4] << 8) | data[offset+5])
+        pos = offset + 6
 
-    # Read type
-    if offset + type_len > len(record):
+    # Type field
+    if pos + type_len > end:
         return None
-    rec_type = record[offset:offset+type_len]
-    offset += type_len
 
-    # Verify: TNF must be 0x01 (Well-Known) and Type must be 'T'
+    # Verify TNF=0x01 and Type='T'
     if tnf != 0x01:
         return None
-    if rec_type != b'T':
+    if type_len != 1 or data[pos] != 0x54:  # 'T'
+        return None
+    pos += type_len
+
+    # Payload
+    if pos + payload_len > end:
+        return None
+    if payload_len < 2:
         return None
 
-    # Read payload
-    if offset + payload_len > len(record):
-        return None
-    payload = record[offset:offset+payload_len]
-
-    if len(payload) < 1:
-        return None
-
-    # Status byte: bit 7 = encoding (0=UTF-8), bits 5:0 = language code length
-    status = payload[0]
+    # Status byte: bit 7 = encoding (0=UTF-8), bits 5:0 = lang code length
+    status = data[pos]
     lang_len = status & 0x3F
 
-    if 1 + lang_len >= len(payload):
+    text_start = pos + 1 + lang_len
+    text_end = pos + payload_len
+
+    if text_start >= text_end:
         return None
 
-    # The actual text starts after status byte + language code
-    text_bytes = payload[1+lang_len:]
-    return text_bytes.decode('utf-8')
+    # Extract text — use memoryview to avoid allocation
+    return bytes(data[text_start:text_end]).decode('utf-8')

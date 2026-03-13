@@ -4,16 +4,18 @@
 # save on unit as: findBaudrate.py
 
 from micropython import const
-from machine import UART
+from machine import UART, Pin
 import utime as time
 from config import *
 from _utils import *
-from _cfg_serial import SERIAL_TIMEOUT_NS
+from _cfg_serial import SERIAL_TIMEOUT_NS, GM60_UART_ID, GM60_TX_PIN, GM60_RX_PIN
 
 BAUDS: tuple = const(((56700, 0x0034, 0), (1200, 0x09c4, 1), (4800, 0x0271, 2), (9600, 0x0139, 3), (
     14400, 0x00d0, 4), (19200, 0x009c, 5), (38400, 0x004e, 6), (56700, 0x0034, 7), (115200, 0x001a, 8)))
 
-uart = UART(2, baudrate=BAUDS[0][0], txbuf=256, rxbuf=256)
+uart = UART(GM60_UART_ID, baudrate=BAUDS[0][0],
+            tx=Pin(GM60_TX_PIN), rx=Pin(GM60_RX_PIN),
+            txbuf=256, rxbuf=256)
 
 def serialWait() -> None | bytes:
     while not uart.txdone():
