@@ -14,6 +14,23 @@ from config import *
 from _utils import *
 
 #########################################
+## Pin conflict check
+if SERIAL_ACTIVE and NFC_ACTIVE:
+    _gm60_pins = {GM60_TX_PIN, GM60_RX_PIN}
+    _nfc_pins = {NFC_TX_PIN, NFC_RX_PIN}
+    if _gm60_pins & _nfc_pins:  # Intersection = shared pins
+        red(f"PIN CONFLICT! GM60 pins {_gm60_pins} overlap with NFC pins {_nfc_pins}")
+        red("Fix _cfg_serial.py and/or _cfg_nfc.py — halting!")
+        while True:
+            time.sleep(1)
+    if GM60_UART_ID == NFC_UART_ID:
+        red(f"UART CONFLICT! GM60 and NFC both use UART({GM60_UART_ID})")
+        red("Fix _cfg_serial.py and/or _cfg_nfc.py — halting!")
+        while True:
+            time.sleep(1)
+    del _gm60_pins, _nfc_pins
+
+#########################################
 ## Find baudrate
 uart = None
 if SERIAL_ACTIVE:
