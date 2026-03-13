@@ -561,11 +561,11 @@ async def tuneandUnlock(_PORTS) -> None:
 #         currentHoldLocktimeMS = 2*HOLD_LOCK_TIME_MS # special case
 # Original values  2960,1023,50,550
 ######***#########******###########**********################*****************************
-_period=30_000		###Main frequency of PWM (in Hz) 18_000+ is beyond average hearing
-_kick_duty=800		# ~78% "power" ( max is 1023 )
-_kick_hold=10		# Hold time in ms for KICK.
-_hold_duty=600		# ~59% of max ( 1023 )
-_hold_lockTime = currentHoldLockTimeMS
+    _period=30_000		###Main frequency of PWM (in Hz) 18_000+ is beyond average hearing
+    _kick_duty=800		# ~78% "power" ( max is 1023 )
+    _kick_hold=10		# Hold time in ms for KICK.
+    _hold_duty=600		# ~59% of max ( 1023 )
+    _hold_lockTime = currentHoldLocktimeMS
 #########******##########*************#############**********################
 
     for _unlock in (_period, _kick_duty, _kick_hold),(_period, _hold_duty, currentHoldLocktimeMS),(_period, 0, 100):
